@@ -1,329 +1,111 @@
-/* Shadh Music — YouTube Music SPA
- * Requires a YouTube Data API v3 key for search/discovery.
- * Playback uses the official YouTube IFrame Player API.
- */
+/* Shadh Music — rebuilt for robust YouTube playback, recommendations and local library. */
 
-const CONFIG = {
-  // Paste your browser-restricted YouTube Data API v3 key here, or use API setup in the UI.
-  API_KEY: localStorage.getItem('shadh_youtube_api_key') || '',
-  REGION: 'IN',
-  LANGUAGE: 'en',
-  RESULTS: 24,
-};
-
+const STORAGE = 'shadh_music_v2';
 const DEFAULT_PLAYLISTS = ['Late Night', 'Focus', 'Favourites'];
+const CONFIG = { API_KEY: localStorage.getItem('shadh_youtube_api_key') || '', REGION: 'IN', LANGUAGE: 'en', RESULTS: 24 };
+const safeJSON = (key, fallback) => { try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch { return fallback; } };
+const legacy = !localStorage.getItem(STORAGE) ? {queue:safeJSON('shadh_queue',[]),history:safeJSON('shadh_history',[]),liked:safeJSON('shadh_liked',[]),playlists:safeJSON('shadh_playlists',null),current:safeJSON('shadh_current',null),shuffle:safeJSON('shadh_shuffle',false),repeat:localStorage.getItem('shadh_repeat'),dark:localStorage.getItem('shadh_theme')!=='light'} : {};
+const base = {...legacy, ...safeJSON(STORAGE, {})};
 const state = {
-  view: 'home',
-  query: '',
-  results: [],
-  queue: JSON.parse(localStorage.getItem('shadh_queue') || '[]'),
-  history: JSON.parse(localStorage.getItem('shadh_history') || '[]'),
-  liked: JSON.parse(localStorage.getItem('shadh_liked') || '[]'),
-  playlists: JSON.parse(localStorage.getItem('shadh_playlists') || JSON.stringify(Object.fromEntries(DEFAULT_PLAYLISTS.map(x => [x, []])))),
-  current: JSON.parse(localStorage.getItem('shadh_current') || 'null'),
-  shuffle: JSON.parse(localStorage.getItem('shadh_shuffle') || 'false'),
-  repeat: localStorage.getItem('shadh_repeat') || 'off',
-  dark: localStorage.getItem('shadh_theme') !== 'light',
-  sleep: null,
-  searchFilter: 'relevance',
+  view: base.view || 'home', query: '', results: [], recommendations: [],
+  queue: Array.isArray(base.queue) ? base.queue : [], history: Array.isArray(base.history) ? base.history : [], liked: Array.isArray(base.liked) ? base.liked : [],
+  playlists: base.playlists && typeof base.playlists === 'object' ? base.playlists : Object.fromEntries(DEFAULT_PLAYLISTS.map(x => [x, []])),
+  current: base.current || null, shuffle: !!base.shuffle, repeat: base.repeat || 'off', dark: base.dark !== false,
+  volume: Number.isFinite(base.volume) ? base.volume : 80, muted: !!base.muted, searchFilter: base.searchFilter || 'relevance', recentSearches: Array.isArray(base.recentSearches) ? base.recentSearches : [],
+  lastRecommendationKey: '', loading: false,
 };
+for (const p of DEFAULT_PLAYLISTS) if (!state.playlists[p]) state.playlists[p] = [];
 
-let ytPlayer = null;
-let ytReady = false;
-let progressTimer = null;
-let sleepTimeout = null;
+let ytPlayer = null; let ytReady = false; let ytApiFailed = false; let progressTimer = null; let sleepTimeout = null; let draggedIndex = -1;
+const $ = s => document.querySelector(s); const $$ = s => [...document.querySelectorAll(s)];
+const htmlEsc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const attrEsc = htmlEsc;
+function persist(){localStorage.setItem(STORAGE, JSON.stringify({view:state.view,queue:state.queue.slice(0,150),history:state.history.slice(0,120),liked:state.liked.slice(0,500),playlists:state.playlists,current:state.current,shuffle:state.shuffle,repeat:state.repeat,dark:state.dark,volume:state.volume,muted:state.muted,recentSearches:state.recentSearches.slice(0,15),searchFilter:state.searchFilter}));localStorage.setItem('shadh_youtube_api_key',CONFIG.API_KEY||'')}
+function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>el.classList.remove('show'),2400)}
+function fmt(sec){if(!Number.isFinite(sec)||sec<0)return '0:00';const s=Math.floor(sec);return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
+function escapeTitle(t){return htmlEsc(t)}
+function thumb(id){return `https://i.ytimg.com/vi/${encodeURIComponent(id)}/hqdefault.jpg`}
+function normalizeTrack(t){return t&&t.id?{id:String(t.id),title:String(t.title||'Untitled'),channel:String(t.channel||'YouTube'),thumb:t.thumb||thumb(t.id),published:t.published||'',duration:t.duration||'',views:t.views||0}:null}
+function dedupe(arr){return [...new Map(arr.filter(Boolean).map(t=>[t.id,t])).values()]}
+function isLiked(id){return state.liked.some(t=>t.id===id)}
+function findTrack(id){return state.results.find(t=>t.id===id)||state.recommendations.find(t=>t.id===id)||state.queue.find(t=>t.id===id)||state.liked.find(t=>t.id===id)||state.history.find(t=>t.id===id)||Object.values(state.playlists).flat().find(t=>t.id===id)||null}
+function setView(view){state.view=view;$('#sidebar').classList.remove('open');render()}
+function formatPublish(date){if(!date)return '';const d=Math.floor((Date.now()-new Date(date).getTime())/86400000);if(d<1)return 'Today';if(d<7)return `${d}d ago`;if(d<30)return `${Math.floor(d/7)}w ago`;if(d<365)return `${Math.floor(d/30)}mo ago`;return `${Math.floor(d/365)}y ago`}
 
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => [...document.querySelectorAll(s)];
+function trackFromSearch(item){const s=item?.snippet||{};const id=item?.id?.videoId||item?.id; if(!id)return null; return normalizeTrack({id,title:s.title||'Untitled',channel:s.channelTitle||'YouTube',thumb:s.thumbnails?.high?.url||s.thumbnails?.medium?.url||thumb(id),published:s.publishedAt||''})}
+function render(){document.documentElement.classList.toggle('light-mode',!state.dark);$$('.nav-item[data-view],.mobile-nav [data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===state.view));$('#likedCount').textContent=state.liked.length;renderSidebar();renderQueue();renderContent();renderPlayer();renderVolume()}
+function renderSidebar(){const el=$('#sidebarPlaylists');el.innerHTML=Object.entries(state.playlists).map(([name,tracks])=>`<button class="playlist-chip" data-playlist="${attrEsc(name)}">♡ ${htmlEsc(name)} <span style="float:right;color:var(--faint)">${tracks.length}</span></button>`).join('');$$('[data-playlist]').forEach(b=>b.onclick=()=>openPlaylist(b.dataset.playlist))}
+function queueHTML(t,i){return `<div class="queue-item ${state.current?.id===t.id?'current':''}" draggable="true" data-index="${i}"><img class="queue-thumb" src="${attrEsc(t.thumb)}" alt="" loading="lazy"><div><div class="queue-title">${escapeTitle(t.title)}</div><div class="queue-sub">${htmlEsc(t.channel)}</div></div><button class="queue-more" data-remove-queue="${i}" title="Remove">×</button></div>`}
+function renderQueue(){const q=state.queue;$('#queueCount').textContent=q.length;$('#queueList').innerHTML=q.length?q.map(queueHTML).join(''):`<div class="empty" style="min-height:250px;border:0;background:transparent"><div><div class="empty-icon">☷</div><h3>Your queue is clear</h3><p>Add tracks from search or recommendations. Drag to reorder.</p></div></div>`;$$('[data-remove-queue]').forEach(b=>b.onclick=e=>{e.stopPropagation();const i=+b.dataset.removeQueue;state.queue.splice(i,1);persist();renderQueue();toast('Removed from queue')});$$('.queue-item[draggable]').forEach(el=>{el.addEventListener('click',e=>{if(e.target.closest('[data-remove-queue]'))return;playTrack(state.queue[+el.dataset.index])});el.addEventListener('dragstart',()=>{draggedIndex=+el.dataset.index;el.classList.add('dragging')});el.addEventListener('dragend',()=>{draggedIndex=-1;el.classList.remove('dragging')});el.addEventListener('dragover',e=>{e.preventDefault()});el.addEventListener('drop',e=>{e.preventDefault();const to=+el.dataset.index;if(draggedIndex<0||draggedIndex===to)return;const [m]=state.queue.splice(draggedIndex,1);state.queue.splice(to,0,m);persist();renderQueue()})})}
+function cardHTML(t,opts={}){const liked=isLiked(t.id);return `<article class="track-card" data-id="${attrEsc(t.id)}"><div class="art"><img src="${attrEsc(t.thumb||thumb(t.id))}" alt="${escapeTitle(t.title)}" loading="lazy"><button class="card-play" data-play="${attrEsc(t.id)}" aria-label="Play ${escapeTitle(t.title)}">▶</button></div><div class="track-info"><div class="track-title" title="${escapeTitle(t.title)}">${escapeTitle(t.title)}</div><div class="track-channel" title="${htmlEsc(t.channel)}">${htmlEsc(t.channel)}</div></div><div class="meta-row">${t.published?`<span>${formatPublish(t.published)}</span>`:''}${t.views?`<span>• ${compact(t.views)} views</span>`:''}</div><div class="card-actions"><button title="Add to queue" data-add="${attrEsc(t.id)}">＋</button><button title="${liked?'Unlike':'Like'}" data-like="${attrEsc(t.id)}">${liked?'♥':'♡'}</button><button title="Playlist" data-pl="${attrEsc(t.id)}">▤</button><button title="YouTube" data-open="${attrEsc(t.id)}">↗</button></div></article>`}
+function compact(n){n=Number(n);if(!Number.isFinite(n)||!n)return '';if(n>=1e9)return `${(n/1e9).toFixed(1)}B`;if(n>=1e6)return `${(n/1e6).toFixed(1)}M`;if(n>=1e3)return `${(n/1e3).toFixed(1)}K`;return String(n)}
+function findAnd(tid){return findTrack(tid)}
+function wireCards(){
+  $$('[data-play]').forEach(b=>b.onclick=()=>{const t=findAnd(b.dataset.play);if(t)playTrack(t)});
+  $$('[data-add]').forEach(b=>b.onclick=()=>{const t=findAnd(b.dataset.add);if(t)addToQueue(t)});
+  $$('[data-like]').forEach(b=>b.onclick=()=>{const t=findAnd(b.dataset.like);if(t)toggleLike(t)});
+  $$('[data-pl]').forEach(b=>b.onclick=()=>{const t=findAnd(b.dataset.pl);if(t)openPlaylistPicker(t)});
+  $$('[data-open]').forEach(b=>b.onclick=()=>window.open(`https://www.youtube.com/watch?v=${encodeURIComponent(b.dataset.open)}`,'_blank','noopener,noreferrer'))
+}
+function renderContent(){const c=$('#content');if(state.view==='home')renderHome(c);else if(state.view==='discover')renderDiscover(c);else if(state.view==='library')renderLibrary(c);else if(state.view==='liked')renderCollection(c,'Liked tracks',state.liked,'Tracks you have saved.');else if(state.view==='history')renderCollection(c,'Listening history',state.history,'Your latest plays, kept locally on this device.');else renderHome(c)}
+function renderHome(c){
+  const basis=state.current?.title||state.history[0]?.title||'';const recs=state.recommendations.length?state.recommendations:[];
+  c.innerHTML=`<section class="hero glass"><div class="hero-copy"><div class="eyebrow">SHADH MUSIC • PERSONAL PLAYER</div><h1>Your music, your atmosphere.</h1><p>Search YouTube, discover similar tracks, build a smart queue, save playlists and let Shadh Music shape recommendations from what you actually listen to.</p><div class="hero-actions"><button class="primary-btn" id="heroSearch">Search music</button><button class="secondary-btn" id="heroRadio">Start smart radio</button></div></div></section>
+    <div class="section-head"><div><div class="eyebrow">QUICK DISCOVERY</div><h2>Pick a mood</h2></div><span>${CONFIG.API_KEY?'YouTube connected':'Demo mode'}</span></div>
+    <div class="mood-row">${['Chill','Focus','Workout','Malayalam','Anirudh','Lo-fi','Romantic','Night drive','Trending'].map(x=>`<button class="mood-chip" data-mood="${attrEsc(x)}">${htmlEsc(x)}</button>`).join('')}</div>
+    <div class="rec-banner"><div><strong>${basis?'More like what you play':'Personalized recommendations'}</strong><p>${basis?`Based on ${htmlEsc(basis.slice(0,52))}${basis.length>52?'…':''}`:'Connect YouTube to unlock live recommendation rows.'}</p></div><button class="primary-btn" id="refreshRecs">Refresh</button></div>
+    ${recs.length?`<div class="section-head"><div><div class="eyebrow">MADE FOR YOU</div><h2>Recommended for you</h2></div><span>${recs.length} tracks</span></div><div class="card-grid">${recs.slice(0,8).map(cardHTML).join('')}</div>`:``}
+    ${state.history.length?`<div class="section-head"><div><div class="eyebrow">RECENTLY PLAYED</div><h2>Continue listening</h2></div><span>${state.history.length} saved locally</span></div><div class="card-grid">${state.history.slice(0,8).map(cardHTML).join('')}</div>`:`<div class="empty" style="margin-top:22px"><div><div class="empty-icon">♪</div><h3>Start your first session</h3><p>Search for an artist, song or vibe. Your listening history will become the seed for smarter recommendations.</p></div></div>`}`;
+  $('#heroSearch').onclick=()=>{$('#searchInput').focus();showSuggestions(true)};$('#heroRadio').onclick=()=>smartRadio();$('#refreshRecs').onclick=()=>loadRecommendations(true);$$('[data-mood]').forEach(b=>b.onclick=()=>doSearch(`${b.dataset.mood} music`));wireCards();
+}
+function renderDiscover(c){c.innerHTML=`<div class="eyebrow">DISCOVER</div><h1 style="margin:5px 0 16px;font-size:32px;letter-spacing:-.055em">Find your next track.</h1><div class="discovery-toolbar">${[['relevance','Relevant'],['date','Newest'],['viewCount','Most viewed'],['rating','Top rated']].map(([v,l])=>`<button class="filter-chip ${state.searchFilter===v?'active':''}" data-filter="${v}">${l}</button>`).join('')}<button class="filter-chip" id="recommendNow">✦ For you</button></div><div class="results-count" style="margin-top:15px">${state.loading?'Searching YouTube…':state.results.length?`${state.results.length} results${state.query?` for “${htmlEsc(state.query)}”`:''}`:'Use the search bar above to start.'}</div><div style="height:14px"></div>${state.results.length?`<div class="card-grid">${state.results.map(cardHTML).join('')}</div>`:`<div class="empty"><div><div class="empty-icon">⌕</div><h3>Search YouTube</h3><p>Try a song, artist, album, language, soundtrack, live set or mood.</p></div></div>`}`;$$('[data-filter]').forEach(b=>b.onclick=()=>{state.searchFilter=b.dataset.filter;doSearch(state.query||'music')});$('#recommendNow').onclick=()=>{state.view='home';render();loadRecommendations(true)};wireCards()}
+function renderLibrary(c){const pls=Object.entries(state.playlists);c.innerHTML=`<div class="eyebrow">LIBRARY</div><h1 style="margin:5px 0 6px;font-size:32px;letter-spacing:-.055em">Your collection.</h1><p style="color:var(--muted);font-size:11px;margin:0">Playlists, likes, history and local backups.</p><div class="section-head"><div><div class="eyebrow">PLAYLISTS</div><h2>Your playlists</h2></div><span>${pls.length}</span></div>${pls.length?`<div class="card-grid">${pls.map(([name,tr])=>`<article class="track-card" style="padding:15px;cursor:pointer" data-open-playlist="${attrEsc(name)}"><div class="empty-icon">♫</div><div class="track-title">${htmlEsc(name)}</div><div class="track-channel">${tr.length} tracks • local</div></article>`).join('')}</div>`:emptyHTML('No playlists','Create one from a track.')}
+  <div class="section-head"><div><div class="eyebrow">SAVED</div><h2>Your likes</h2></div><span>${state.liked.length}</span></div>${state.liked.length?`<div class="card-grid">${state.liked.slice(0,8).map(cardHTML).join('')}</div>`:emptyHTML('Nothing liked yet','Tap ♡ on any track.')}
+  <div class="section-head"><div><div class="eyebrow">TOOLS</div><h2>Local backup</h2></div></div><div class="settings-grid"><button class="setting-card" id="exportData"><strong>Export library</strong><span>Download playlists, likes, queue and history as JSON.</span></button><button class="setting-card" id="importData"><strong>Import library</strong><span>Restore a Shadh Music JSON backup on this device.</span></button></div>`;$$('[data-open-playlist]').forEach(b=>b.onclick=()=>openPlaylist(b.dataset.openPlaylist));$('#exportData').onclick=exportData;$('#importData').onclick=importData;wireCards()}
+function renderCollection(c,title,items,desc){c.innerHTML=`<div class="eyebrow">LIBRARY</div><h1 style="margin:5px 0 7px;font-size:32px;letter-spacing:-.055em">${htmlEsc(title)}</h1><p style="color:var(--muted);font-size:11px;margin:0 0 18px">${htmlEsc(desc)}</p>${items.length?`<div class="card-grid">${items.map(cardHTML).join('')}</div>`:emptyHTML(title,'Nothing here yet.')}${title==='Listening history'&&items.length?`<div class="modal-row"><button class="secondary-btn" id="clearHistoryLocal">Clear history</button></div>`:''}`;if($('#clearHistoryLocal'))$('#clearHistoryLocal').onclick=()=>{state.history=[];persist();render();toast('History cleared')};wireCards()}
+function emptyHTML(h,p){return `<div class="empty"><div><div class="empty-icon">♪</div><h3>${htmlEsc(h)}</h3><p>${htmlEsc(p)}</p></div></div>`}
+function renderPlayer(){const t=state.current;$('#playerTitle').textContent=t?.title||'Nothing playing';$('#playerChannel').textContent=t?.channel||'Choose a track to start';$('#playerLikeBtn').textContent=t&&isLiked(t.id)?'♥':'♡';$('#miniArtWrap').innerHTML=t?`<img class="mini-art" src="${attrEsc(t.thumb)}" alt="">`:`<div class="mini-art placeholder-art">♪</div>`;$('#shuffleBtn').style.opacity=state.shuffle?'1':'.55';$('#repeatBtn').style.opacity=state.repeat!=='off'?'1':'.55';$('#repeatBtn').textContent=state.repeat==='one'?'↻1':'↻';$('#muteBtn').textContent=state.muted?'◌':'◖';$('#playPauseBtn').textContent=(ytPlayer&&ytReady&&ytPlayer.getPlayerState?.()===1)?'Ⅱ':'▶';setMediaSession()}
+function renderVolume(){const v=state.muted?0:state.volume;$('#volumeRange').value=state.volume;$('#volumeRange').style.setProperty('--p',`${v}%`)}
+function addToQueue(t,play=false){t=normalizeTrack(t);if(!t)return;if(!state.queue.some(x=>x.id===t.id))state.queue.push(t);persist();renderQueue();if(play)playTrack(t);else toast(`${t.title.slice(0,42)} added to queue`)}
+function toggleLike(t){t=normalizeTrack(t);if(!t)return;if(isLiked(t.id))state.liked=state.liked.filter(x=>x.id!==t.id);else state.liked.unshift(t);persist();render();toast(isLiked(t.id)?'Saved to liked':'Removed from liked')}
+function playTrack(t){t=normalizeTrack(t);if(!t)return;state.current=t;if(!state.queue.some(x=>x.id===t.id))state.queue.push(t);state.history=[t,...state.history.filter(x=>x.id!==t.id)].slice(0,120);persist();renderPlayer();renderQueue();updateRecommendationsSoon();setMediaSession();if(ytReady&&ytPlayer){try{ytPlayer.loadVideoById({videoId:t.id,startSeconds:0});}
+catch{try{ytPlayer.loadVideoById(t.id)}catch{toast('Could not start this YouTube track')}}}else{toast(ytApiFailed?'YouTube player unavailable':'YouTube player is loading…')}startProgress()}
+function nextTrack(){if(!state.queue.length)return;let idx=state.queue.findIndex(x=>x.id===state.current?.id);if(idx<0){playTrack(state.queue[0]);return}if(state.repeat==='one'){playTrack(state.queue[idx]);return}if(state.shuffle&&state.queue.length>1){let n=idx;while(n===idx)n=Math.floor(Math.random()*state.queue.length);playTrack(state.queue[n]);return}if(idx<state.queue.length-1)playTrack(state.queue[idx+1]);else if(state.repeat==='all')playTrack(state.queue[0]);else toast('Queue finished')}
+function prevTrack(){if(!state.queue.length)return;if(ytReady&&ytPlayer&&ytPlayer.getCurrentTime?.()>5){ytPlayer.seekTo(0,true);return}const idx=state.queue.findIndex(x=>x.id===state.current?.id);playTrack(state.queue[Math.max(0,idx-1)])}
+function togglePlay(){if(!state.current){$('#searchInput').focus();toast('Choose a track first');return}if(!ytReady||!ytPlayer){toast('YouTube player is still loading');return}const s=ytPlayer.getPlayerState();if(s===1)ytPlayer.pauseVideo();else ytPlayer.playVideo()}
+function seekBy(delta){if(!ytReady||!ytPlayer)return;ytPlayer.seekTo(Math.max(0,ytPlayer.getCurrentTime()+delta),true)}
+function startProgress(){clearInterval(progressTimer);progressTimer=setInterval(()=>{if(!ytReady||!ytPlayer)return;try{const d=ytPlayer.getDuration(),c=ytPlayer.getCurrentTime(),p=d?c/d*100:0;$('#currentTime').textContent=fmt(c);$('#duration').textContent=fmt(d);$('#progressRange').value=Math.round(p*10);$('#progressRange').style.setProperty('--p',`${p}%`)}catch{}},500)}
 
-function esc(value='') {
-  return value.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-function fmtTime(sec) {
-  if (!Number.isFinite(sec)) return '0:00';
-  const s = Math.max(0, Math.floor(sec));
-  const m = Math.floor(s / 60);
-  return `${m}:${String(s % 60).padStart(2,'0')}`;
-}
-function saveState() {
-  localStorage.setItem('shadh_queue', JSON.stringify(state.queue));
-  localStorage.setItem('shadh_history', JSON.stringify(state.history.slice(0,100)));
-  localStorage.setItem('shadh_liked', JSON.stringify(state.liked));
-  localStorage.setItem('shadh_playlists', JSON.stringify(state.playlists));
-  localStorage.setItem('shadh_current', JSON.stringify(state.current));
-  localStorage.setItem('shadh_shuffle', JSON.stringify(state.shuffle));
-  localStorage.setItem('shadh_repeat', state.repeat);
-  localStorage.setItem('shadh_theme', state.dark ? 'dark' : 'light');
-}
-function toast(msg) {
-  const el = $('#toast'); el.textContent = msg; el.classList.add('show');
-  clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('show'), 2200);
-}
-function trackFromSearch(item) {
-  const s = item.snippet || {};
-  const id = item.id?.videoId || item.id;
-  return { id, title: s.title || 'Untitled', channel: s.channelTitle || 'YouTube', thumb: s.thumbnails?.high?.url || s.thumbnails?.medium?.url || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, published: s.publishedAt || '' };
-}
-function dedupe(list) { return [...new Map(list.map(x => [x.id, x])).values()]; }
-function isLiked(id) { return state.liked.some(x => x.id === id); }
+async function api(path,params={}){const key=(CONFIG.API_KEY||'').trim();if(!key)throw new Error('API_KEY_MISSING');const u=new URL(`https://www.googleapis.com/youtube/v3/${path}`);u.searchParams.set('key',key);for(const [k,v] of Object.entries(params))u.searchParams.set(k,v);const r=await fetch(u.toString(),{headers:{Accept:'application/json'}});let data={};try{data=await r.json()}catch{}if(!r.ok||data.error){const msg=data.error?.message||`YouTube request failed (${r.status})`;const e=new Error(msg);e.code=data.error?.errors?.[0]?.reason||r.status;e.status=r.status;throw e}return data}
+function cacheKey(q,filter){return `${filter}|${q.trim().toLowerCase()}`}
+const searchCache=new Map();
+async function doSearch(q){q=(q||'').trim();if(!q)return;state.query=q;state.view='discover';state.loading=true;state.results=[];persist();render();try{const key=cacheKey(q,state.searchFilter);let data=searchCache.get(key);if(!data){data=await api('search',{part:'snippet',q,type:'video',videoEmbeddable:'true',videoSyndicated:'true',maxResults:CONFIG.RESULTS,order:state.searchFilter,regionCode:CONFIG.REGION,relevanceLanguage:CONFIG.LANGUAGE,safeSearch:'moderate'});searchCache.set(key,data)}state.results=dedupe((data.items||[]).map(trackFromSearch));state.loading=false;state.recentSearches=[q,...state.recentSearches.filter(x=>x.toLowerCase()!==q.toLowerCase())].slice(0,15);persist();render();toast(`${state.results.length} results`);loadRecommendations(false)}catch(e){state.loading=false;state.results=[];render();handleApiError(e)}}
+function handleApiError(e){if(e.message==='API_KEY_MISSING')toast('Add a YouTube API key in Connect YouTube');else if(e.status===403)toast('YouTube API access was denied or quota-limited');else toast(e.message||'YouTube search failed')}
+function recommendationSeeds(){const seeds=[];if(state.query)seeds.push(state.query);if(state.current){seeds.push(state.current.title);if(state.current.channel)seeds.push(`${state.current.channel} songs`)}state.liked.slice(0,3).forEach(t=>seeds.push(t.title));state.history.slice(0,3).forEach(t=>seeds.push(t.title));return dedupe(seeds.map(title=>({id:title,title,channel:'seed'}))).map(x=>x.title)}
+async function loadRecommendations(force=false){if(!CONFIG.API_KEY){state.recommendations=[];return}if(!navigator.onLine){return}const seed=recommendationSeeds()[0]||'trending music 2026';const key=seed.toLowerCase();if(!force&&state.lastRecommendationKey===key&&state.recommendations.length)return;state.lastRecommendationKey=key;try{const variants=[seed,`${seed} similar songs`,`${state.current?.channel||''} music`].filter(Boolean);const arrays=await Promise.all(variants.slice(0,3).map(q=>api('search',{part:'snippet',q,type:'video',videoEmbeddable:'true',videoSyndicated:'true',maxResults:8,order:'relevance',regionCode:CONFIG.REGION,relevanceLanguage:CONFIG.LANGUAGE,safeSearch:'moderate'}).catch(()=>({items:[]}))));state.recommendations=dedupe(arrays.flatMap(x=>(x.items||[]).map(trackFromSearch))).filter(t=>!state.history.some(h=>h.id===t.id)).slice(0,16);render()}catch{}}
+let recTimer=null;function updateRecommendationsSoon(){clearTimeout(recTimer);recTimer=setTimeout(()=>loadRecommendations(true),700)}
+async function smartRadio(){if(!state.current){if(state.history[0])playTrack(state.history[0]);else{await doSearch('chill music');if(state.results[0])playTrack(state.results[0])}}const current=state.current;if(!current)return;await loadRecommendations(true);state.recommendations.slice(0,8).forEach(t=>addToQueue(t));toast('Smart radio filled your queue')}
 
-function render() {
-  document.documentElement.classList.toggle('light-mode', !state.dark);
-  $$('.nav-item[data-view]').forEach(btn => btn.classList.toggle('active', btn.dataset.view === state.view));
-  renderSidebar(); renderQueue(); renderContent(); renderPlayer();
-}
+function setupYT(){if(ytPlayer||ytApiFailed)return;if(!window.YT?.Player){ytApiFailed=true;toast('YouTube player API did not load');return}try{ytPlayer=new YT.Player('youtubePlayer',{height:'1',width:'1',videoId:state.current?.id||'',playerVars:{autoplay:0,controls:0,disablekb:1,playsinline:1,rel:0,modestbranding:1},events:{onReady:e=>{ytReady=true;e.target.setVolume(state.muted?0:state.volume);render();renderVolume();startProgress();if(state.current) setMediaSession()},onStateChange:onPlayerStateChange,onError:e=>toast(`YouTube playback error (${e.data})`)}})}catch{ytApiFailed=true;toast('Could not initialize YouTube player')}}
+function onPlayerStateChange(e){if(e.data===1){$('#playPauseBtn').textContent='Ⅱ';setMediaSession()}else if(e.data===2)$('#playPauseBtn').textContent='▶';else if(e.data===0)nextTrack()}
+window.onYouTubeIframeAPIReady=setupYT;if(window.YT?.Player)setTimeout(setupYT,0);
+function setMediaSession(){if(!('mediaSession' in navigator)||!state.current)return;try{navigator.mediaSession.metadata=new MediaMetadata({title:state.current.title,artist:state.current.channel,album:'Shadh Music',artwork:[{src:state.current.thumb,sizes:'480x360',type:'image/jpeg'}]});navigator.mediaSession.setActionHandler('play',togglePlay);navigator.mediaSession.setActionHandler('pause',togglePlay);navigator.mediaSession.setActionHandler('nexttrack',nextTrack);navigator.mediaSession.setActionHandler('previoustrack',prevTrack);navigator.mediaSession.setActionHandler('seekbackward',()=>seekBy(-10));navigator.mediaSession.setActionHandler('seekforward',()=>seekBy(10))}catch{}}
 
-function renderSidebar() {
-  $('#sidebarPlaylists').innerHTML = Object.keys(state.playlists).map(name => `<button class="playlist-chip" data-playlist="${esc(name)}">♡ ${esc(name)}</button>`).join('');
-  $$('.playlist-chip').forEach(b => b.onclick = () => openPlaylist(b.dataset.playlist));
-}
+function openModal(html){$('#modalContent').innerHTML=html;$('#modalBackdrop').hidden=false;setTimeout(()=>$('#modalContent input, #modalContent button')?.focus(),20)}function closeModal(){ $('#modalBackdrop').hidden=true }
+function openApiSetup(){openModal(`<h3 id="modalTitle">Connect YouTube</h3><p>Use a browser-restricted YouTube Data API v3 key for search and recommendation features. Playback uses the official YouTube IFrame Player API.</p><div class="field"><label>API key</label><input id="apiKeyInput" type="password" value="${attrEsc(CONFIG.API_KEY)}" placeholder="AIza…" autocomplete="off"></div><div class="settings-grid"><div class="setting-card"><strong>1 · Google Cloud</strong><span>Create or select a project and enable YouTube Data API v3.</span></div><div class="setting-card"><strong>2 · Restrict it</strong><span>Limit the key to your web origin and YouTube Data API.</span></div></div><div class="modal-row"><button class="secondary-btn" id="apiClearBtn">Clear</button><button class="primary-btn" id="apiSaveBtn">Save & test</button></div>`);$('#apiSaveBtn').onclick=async()=>{CONFIG.API_KEY=$('#apiKeyInput').value.trim();persist();closeModal();if(!CONFIG.API_KEY){toast('API key cleared');return}toast('Testing YouTube access…');try{await api('search',{part:'snippet',q:'music',type:'video',maxResults:1});toast('YouTube connected');loadRecommendations(true)}catch(e){handleApiError(e)}};$('#apiClearBtn').onclick=()=>{CONFIG.API_KEY='';persist();$('#apiKeyInput').value='';toast('API key cleared')}}
+function openSettings(){openModal(`<h3 id="modalTitle">Settings</h3><p>Shadh Music stores your library on this browser. YouTube receives only the search requests you make and the playback embeds you choose.</p><div class="settings-grid"><button class="setting-card" id="themeSetting"><strong>Appearance</strong><span>${state.dark?'OLED dark':'Light clay'}.</span></button><button class="setting-card" id="exportSetting"><strong>Export backup</strong><span>Download your local music library.</span></button><button class="setting-card" id="resetSetting"><strong>Reset local data</strong><span>Clear queue, history, likes and playlists.</span></button><button class="setting-card" id="keyboardSetting"><strong>Keyboard</strong><span>Space play/pause · J/K previous/next · M mute · ←/→ seek · S shuffle · R repeat · / search.</span></button></div>`);$('#themeSetting').onclick=()=>{state.dark=!state.dark;persist();render();openSettings()};$('#exportSetting').onclick=exportData;$('#resetSetting').onclick=()=>{if(confirm('Reset all local Shadh Music data?')){localStorage.removeItem(STORAGE);state.queue=[];state.history=[];state.liked=[];state.playlists=Object.fromEntries(DEFAULT_PLAYLISTS.map(x=>[x,[]]));state.current=null;persist();closeModal();render();toast('Local data reset')}}}
+function openProfile(){openModal(`<h3 id="modalTitle">Shadh Music</h3><p>Your personal music space is local-first. No account is required for playlists, likes, queue or history.</p><div class="rec-banner"><div><strong>${state.history.length} plays</strong><p>${state.liked.length} liked tracks · ${Object.keys(state.playlists).length} playlists · ${state.queue.length} queued</p></div><button class="primary-btn" id="profileDone">Done</button></div>`);$('#profileDone').onclick=closeModal}
+function openPlaylist(name){const tracks=state.playlists[name]||[];openModal(`<h3 id="modalTitle">${htmlEsc(name)}</h3><p>${tracks.length} tracks in this local playlist.</p>${tracks.length?`<div class="queue-list" style="max-height:430px">${tracks.map((t,i)=>`<div class="queue-item"><img class="queue-thumb" src="${attrEsc(t.thumb)}" alt=""><div><div class="queue-title">${htmlEsc(t.title)}</div><div class="queue-sub">${htmlEsc(t.channel)}</div></div><button class="queue-more" data-pl-remove="${i}" data-pl-name="${attrEsc(name)}">×</button></div>`).join('')}</div>`:emptyHTML('Playlist empty','Add tracks with the ▤ button.') }<div class="modal-row"><button class="secondary-btn" id="renamePl">Rename</button><button class="secondary-btn" id="deletePl">Delete</button><button class="primary-btn" id="closePl">Done</button></div>`);$('#closePl').onclick=closeModal;$('#renamePl').onclick=()=>renamePlaylist(name);$('#deletePl').onclick=()=>{if(confirm(`Delete playlist “${name}”?`)){delete state.playlists[name];persist();closeModal();render();toast('Playlist deleted')}};$$('[data-pl-remove]').forEach(b=>b.onclick=()=>{const n=b.dataset.plName;state.playlists[n].splice(+b.dataset.plRemove,1);persist();openPlaylist(n);renderSidebar()})}
+function renamePlaylist(name){openModal(`<h3 id="modalTitle">Rename playlist</h3><div class="field"><label>New name</label><input id="renameInput" value="${attrEsc(name)}" maxlength="40"></div><div class="modal-row"><button class="secondary-btn" id="cancelRename">Cancel</button><button class="primary-btn" id="saveRename">Save</button></div>`);$('#cancelRename').onclick=closeModal;$('#saveRename').onclick=()=>{const n=$('#renameInput').value.trim();if(!n)return toast('Enter a name');if(state.playlists[n]&&n!==name)return toast('That playlist already exists');state.playlists[n]=state.playlists[name];if(n!==name)delete state.playlists[name];persist();closeModal();render();toast('Playlist renamed')}}
+function createPlaylist(seed=null){openModal(`<h3 id="modalTitle">New playlist</h3><p>Create a local collection you can edit anytime.</p><div class="field"><label>Playlist name</label><input id="plName" maxlength="40" placeholder="Sunday drive"></div><div class="modal-row"><button class="secondary-btn" id="cancelPlCreate">Cancel</button><button class="primary-btn" id="savePlCreate">Create</button></div>`);$('#cancelPlCreate').onclick=closeModal;$('#savePlCreate').onclick=()=>{const n=$('#plName').value.trim();if(!n)return toast('Enter a name');if(state.playlists[n])return toast('Playlist already exists');state.playlists[n]=seed?[seed]:[];persist();closeModal();render();toast(`Created “${n}”`)}}
+function openPlaylistPicker(t){const names=Object.keys(state.playlists);openModal(`<h3 id="modalTitle">Add to playlist</h3><p>${escapeTitle(t.title)}</p><div class="settings-grid">${names.map(n=>`<button class="setting-card" data-pick="${attrEsc(n)}"><strong>${htmlEsc(n)}</strong><span>${state.playlists[n].length} tracks</span></button>`).join('')}</div><div class="modal-row"><button class="secondary-btn" id="newFromPicker">＋ New playlist</button></div>`);$$('[data-pick]').forEach(b=>b.onclick=()=>{const n=b.dataset.pick;if(!state.playlists[n].some(x=>x.id===t.id))state.playlists[n].push(t);persist();closeModal();renderSidebar();toast(`Added to ${n}`)});$('#newFromPicker').onclick=()=>{closeModal();createPlaylist(t)}}
+function openSleepTimer(){openModal(`<h3 id="modalTitle">Sleep timer</h3><p>Stop playback automatically.</p><div class="settings-grid">${[15,30,45,60,90].map(m=>`<button class="setting-card" data-sleep="${m}"><strong>${m} minutes</strong><span>Pause playback</span></button>`).join('')}<button class="setting-card" data-sleep="0"><strong>Off</strong><span>Cancel timer</span></button></div>`);$$('[data-sleep]').forEach(b=>b.onclick=()=>{const m=+b.dataset.sleep;clearTimeout(sleepTimeout);sleepTimeout=m?setTimeout(()=>{if(ytPlayer)ytPlayer.pauseVideo();toast('Sleep timer finished')},m*60000):null;closeModal();toast(m?`Sleep timer set: ${m} min`:'Sleep timer off')})}
+function openNowPlaying(){if(!state.current){toast('Nothing playing');return}const t=state.current;openModal(`<div class="now-playing"><img class="now-playing-art" src="${attrEsc(t.thumb)}" alt=""><div><div class="eyebrow">NOW PLAYING</div><div class="big-title">${escapeTitle(t.title)}</div><div style="font-size:10px;color:var(--muted)">${htmlEsc(t.channel)}</div><div class="wave">${Array.from({length:42},(_,i)=>`<i style="animation-delay:${(i%9)*.06}s"></i>`).join('')}</div><div class="modal-row" style="justify-content:flex-start"><button class="secondary-btn" id="openYTNow">Open on YouTube</button><button class="primary-btn" id="npPlay">Play / Pause</button></div></div></div>`);$('#npPlay').onclick=togglePlay;$('#openYTNow').onclick=()=>window.open(`https://www.youtube.com/watch?v=${encodeURIComponent(t.id)}`,'_blank','noopener,noreferrer')}
+function exportData(){const data={version:2,exportedAt:new Date().toISOString(),queue:state.queue,history:state.history,liked:state.liked,playlists:state.playlists,current:state.current};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='shadh-music-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);toast('Backup exported')}
+function importData(){const input=document.createElement('input');input.type='file';input.accept='application/json,.json';input.onchange=async()=>{const f=input.files?.[0];if(!f)return;try{const d=JSON.parse(await f.text());if(Array.isArray(d.queue))state.queue=dedupe(d.queue.map(normalizeTrack));if(Array.isArray(d.history))state.history=dedupe(d.history.map(normalizeTrack));if(Array.isArray(d.liked))state.liked=dedupe(d.liked.map(normalizeTrack));if(d.playlists&&typeof d.playlists==='object')state.playlists=Object.fromEntries(Object.entries(d.playlists).map(([k,v])=>[k,dedupe((Array.isArray(v)?v:[]).map(normalizeTrack))]));state.current=normalizeTrack(d.current)||state.current;persist();render();toast('Backup imported')}catch{toast('Invalid Shadh Music backup')}};input.click()}
+function showSuggestions(force=false){const box=$('#searchSuggestions');const q=$('#searchInput').value.trim().toLowerCase();const list=q?state.recentSearches.filter(x=>x.toLowerCase().includes(q)).slice(0,6):state.recentSearches.slice(0,6);if(!force&&!list.length){box.hidden=true;return}box.innerHTML=list.length?list.map(x=>`<button class="suggestion" data-suggestion="${attrEsc(x)}">◷ ${htmlEsc(x)}</button>`).join(''):`<div class="suggestion">Tip: try “Malayalam melody”, “lofi focus”, or an artist name.</div>`;box.hidden=false;$$('[data-suggestion]').forEach(b=>b.onclick=()=>{const q=b.dataset.suggestion;$('#searchInput').value=q;box.hidden=true;doSearch(q)})}
 
-function renderQueue() {
-  const q = state.queue;
-  $('#queueList').innerHTML = q.length ? q.map((t,i) => `
-    <div class="queue-item ${state.current?.id === t.id ? 'current':''}" data-index="${i}">
-      <img class="queue-thumb" src="${esc(t.thumb)}" alt="" loading="lazy" />
-      <div><div class="queue-title">${esc(t.title)}</div><div class="queue-sub">${esc(t.channel)}</div></div>
-      <button class="queue-more" data-remove="${i}" title="Remove">×</button>
-    </div>`).join('') : `<div class="empty" style="min-height:220px;border:0;background:transparent"><div><div class="empty-icon">☷</div><h3>Your queue is clear</h3><p>Add tracks with + or choose a search result to start playing.</p></div></div>`;
-  $$('.queue-item').forEach(el => el.onclick = e => { if (e.target.closest('[data-remove]')) return; const t=q[+el.dataset.index]; playTrack(t); });
-  $$('[data-remove]').forEach(b => b.onclick = e => { e.stopPropagation(); state.queue.splice(+b.dataset.remove,1); saveState(); renderQueue(); });
-}
+// Events
+$$('.nav-item[data-view],.mobile-nav [data-view]').forEach(b=>b.onclick=()=>setView(b.dataset.view));$('#newPlaylistBtn').onclick=()=>createPlaylist();$('#settingsBtn').onclick=openSettings;$('#apiBtn').onclick=openApiSetup;$('#profileBtn').onclick=openProfile;$('#mobileMenuBtn').onclick=()=>$('#sidebar').classList.toggle('open');$('#themeBtn').onclick=()=>{state.dark=!state.dark;persist();render()};$('#sleepBtn').onclick=openSleepTimer;$('#focusSearchBtn').onclick=()=>{$('#searchInput').focus();showSuggestions(true)};$('#searchClearBtn').onclick=()=>{$('#searchInput').value='';$('#searchSuggestions').hidden=true;$('#searchInput').focus()};$('#searchInput').addEventListener('input',()=>{showSuggestions(false);$('#searchClearBtn').style.display=$('#searchInput').value?'block':''});$('#searchInput').addEventListener('focus',()=>showSuggestions(false));$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();$('#searchSuggestions').hidden=true;doSearch(e.target.value)}if(e.key==='Escape')$('#searchSuggestions').hidden=true});document.addEventListener('click',e=>{if(!e.target.closest('.search-wrap'))$('#searchSuggestions').hidden=true});$('#playPauseBtn').onclick=togglePlay;$('#nextBtn').onclick=nextTrack;$('#prevBtn').onclick=prevTrack;$('#shuffleBtn').onclick=()=>{state.shuffle=!state.shuffle;persist();renderPlayer();toast(state.shuffle?'Shuffle on':'Shuffle off')};$('#repeatBtn').onclick=()=>{state.repeat=state.repeat==='off'?'all':state.repeat==='all'?'one':'off';persist();renderPlayer();toast(`Repeat ${state.repeat}`)};$('#clearQueueBtn').onclick=()=>{state.queue=[];persist();renderQueue();toast('Queue cleared')};$('#shuffleQueueBtn').onclick=()=>{for(let i=state.queue.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[state.queue[i],state.queue[j]]=[state.queue[j],state.queue[i]]}state.shuffle=true;persist();renderQueue();renderPlayer();toast('Queue shuffled')};$('#queueToggleBtn').onclick=()=>$('#queuePanel').scrollIntoView({behavior:'smooth'});$('#nowPlayingBtn').onclick=openNowPlaying;$('#playerLikeBtn').onclick=()=>state.current&&toggleLike(state.current);$('#volumeRange').oninput=e=>{state.volume=+e.target.value;state.muted=state.volume===0;if(ytPlayer&&ytReady)ytPlayer.setVolume(state.volume);persist();renderVolume()};$('#muteBtn').onclick=()=>{state.muted=!state.muted;if(ytPlayer&&ytReady)ytPlayer.setVolume(state.muted?0:state.volume);persist();renderPlayer();renderVolume()};$('#progressRange').oninput=e=>{if(ytPlayer&&ytReady){const d=ytPlayer.getDuration?.();if(d)ytPlayer.seekTo((+e.target.value/1000)*d,true)}};$('#modalClose').onclick=closeModal;$('#modalBackdrop').onclick=e=>{if(e.target.id==='modalBackdrop')closeModal()};document.addEventListener('keydown',e=>{if(['INPUT','TEXTAREA','SELECT'].includes(e.target.tagName))return;switch(e.key.toLowerCase()){case ' ':e.preventDefault();togglePlay();break;case 'j':case 'k':if(e.key.toLowerCase()==='j')prevTrack();else nextTrack();break;case 'm':$('#muteBtn').click();break;case 's':$('#shuffleBtn').click();break;case 'r':$('#repeatBtn').click();break;case 'q':openNowPlaying();break;case '/':e.preventDefault();$('#searchInput').focus();showSuggestions(true);break;case 'arrowleft':seekBy(-10);break;case 'arrowright':seekBy(10);break}});
 
-function cardHTML(t) {
-  return `<article class="track-card" data-id="${esc(t.id)}">
-    <div class="art"><img src="${esc(t.thumb)}" alt="${esc(t.title)}" loading="lazy" /><button class="card-play" data-play="${esc(t.id)}">▶</button></div>
-    <div class="track-info"><div class="track-title" title="${esc(t.title)}">${esc(t.title)}</div><div class="track-channel" title="${esc(t.channel)}">${esc(t.channel)}</div></div>
-    <div class="card-actions">
-      <button title="Add to queue" data-add="${esc(t.id)}">＋</button>
-      <button title="Like" data-like="${esc(t.id)}">${isLiked(t.id) ? '♥' : '♡'}</button>
-      <button title="Add to playlist" data-pl="${esc(t.id)}">▤</button>
-      <button title="Open on YouTube" data-open="${esc(t.id)}">↗</button>
-    </div>
-  </article>`;
-}
-
-function wireCards() {
-  $$('[data-play]').forEach(b => b.onclick = () => { const t = findTrack(b.dataset.play); if(t) playTrack(t); });
-  $$('[data-add]').forEach(b => b.onclick = () => { const t=findTrack(b.dataset.add); if(!t)return; addToQueue(t); });
-  $$('[data-like]').forEach(b => b.onclick = () => { const t=findTrack(b.dataset.like); if(!t)return; toggleLike(t); });
-  $$('[data-pl]').forEach(b => b.onclick = () => { const t=findTrack(b.dataset.pl); if(t) openPlaylistPicker(t); });
-  $$('[data-open]').forEach(b => b.onclick = () => window.open(`https://www.youtube.com/watch?v=${encodeURIComponent(b.dataset.open)}`, '_blank', 'noopener'));
-}
-function findTrack(id) { return state.results.find(x=>x.id===id) || state.queue.find(x=>x.id===id) || state.liked.find(x=>x.id===id) || state.history.find(x=>x.id===id) || Object.values(state.playlists).flat().find(x=>x.id===id); }
-
-function renderContent() {
-  const c = $('#content');
-  if (state.view === 'home') return renderHome(c);
-  if (state.view === 'discover') return renderDiscover(c);
-  if (state.view === 'library') return renderLibrary(c);
-  if (state.view === 'history') return renderCollection(c, 'Listening history', state.history, 'Your recent plays appear here.');
-  if (state.view === 'liked') return renderCollection(c, 'Liked tracks', state.liked, 'Save tracks here for an instant personal library.');
-  renderHome(c);
-}
-
-function renderHome(c) {
-  const featured = state.results.slice(0,8);
-  c.innerHTML = `
-    <section class="hero glass-panel">
-      <div class="hero-copy">
-        <div class="eyebrow">SHADH MUSIC • YOUTUBE</div>
-        <h1>A calmer way to listen.</h1>
-        <p>Search YouTube, build a queue, keep your favourite tracks, and turn the whole thing into a soft, tactile player that feels closer to a music app than a web page.</p>
-        <div class="hero-actions"><button class="primary-btn" id="heroSearch">Start exploring</button><button class="secondary-btn" id="heroDemo">Play a sample</button></div>
-      </div>
-    </section>
-    <div class="section-head"><div><div class="eyebrow">DISCOVER</div><h2>${state.results.length ? 'Fresh from your search' : 'Start with a search'}</h2></div><span>${CONFIG.API_KEY ? 'YouTube connected' : 'API key not set'}</span></div>
-    ${featured.length ? `<div class="card-grid">${featured.map(cardHTML).join('')}</div>` : emptySearchHTML()}
-    ${state.history.length ? `<div class="section-head"><div><div class="eyebrow">RECENTLY PLAYED</div><h2>Pick up where you left off</h2></div><span>${state.history.length} tracks</span></div><div class="card-grid">${state.history.slice(0,4).map(cardHTML).join('')}</div>` : ''}
-  `;
-  $('#heroSearch').onclick = () => $('#searchInput').focus();
-  $('#heroDemo').onclick = () => { const samples = demoTracks(); playTrack(samples[0]); };
-  wireCards();
-}
-
-function renderDiscover(c) {
-  c.innerHTML = `<div class="eyebrow">DISCOVER</div><h1 style="margin:5px 0 18px;font-size:32px;letter-spacing:-.05em">Find your next track.</h1>
-    <div class="discovery-toolbar">${[['relevance','Relevant'],['date','Newest'],['viewCount','Most viewed'],['rating','Top rated']].map(([v,l])=>`<button class="filter-chip ${state.searchFilter===v?'active':''}" data-filter="${v}">${l}</button>`).join('')}</div>
-    <div class="results-count">${state.results.length ? `${state.results.length} results${state.query ? ` for “${esc(state.query)}”` : ''}` : 'Search YouTube from the bar above.'}</div>
-    <div style="height:14px"></div>${state.results.length ? `<div class="card-grid">${state.results.map(cardHTML).join('')}</div>` : emptySearchHTML()}`;
-  $$('[data-filter]').forEach(b=>b.onclick=()=>{state.searchFilter=b.dataset.filter; doSearch(state.query || 'music');}); wireCards();
-}
-
-function renderLibrary(c) {
-  const allPlaylists = Object.entries(state.playlists);
-  c.innerHTML = `<div class="eyebrow">LIBRARY</div><h1 style="margin:5px 0 18px;font-size:32px;letter-spacing:-.05em">Your collection.</h1>
-    <div class="section-head"><div><div class="eyebrow">PLAYLISTS</div><h2>Built by you</h2></div><span>${allPlaylists.length} playlists</span></div>
-    ${allPlaylists.length ? `<div class="card-grid">${allPlaylists.map(([name,tracks])=>`<article class="track-card" style="padding:15px;cursor:pointer" data-open-playlist="${esc(name)}"><div class="empty-icon">♫</div><div class="track-title">${esc(name)}</div><div class="track-channel">${tracks.length} tracks • local</div></article>`).join('')}</div>` : emptyHTML('No playlists yet','Create a playlist from the sidebar.')}
-    <div class="section-head"><div><div class="eyebrow">SAVED</div><h2>Liked</h2></div><span>${state.liked.length} tracks</span></div>
-    ${state.liked.length ? `<div class="card-grid">${state.liked.slice(0,8).map(cardHTML).join('')}</div>` : emptyHTML('Nothing liked yet','Tap ♡ on a track to save it here.')}`;
-  $$('[data-open-playlist]').forEach(b=>b.onclick=()=>openPlaylist(b.dataset.openPlaylist)); wireCards();
-}
-
-function renderCollection(c,title,items,desc) {
-  c.innerHTML = `<div class="eyebrow">LIBRARY</div><h1 style="margin:5px 0 7px;font-size:32px;letter-spacing:-.05em">${esc(title)}</h1><p style="color:var(--muted);font-size:12px;margin:0 0 18px">${esc(desc)}</p>${items.length ? `<div class="card-grid">${items.map(cardHTML).join('')}</div>` : emptyHTML(title,'Nothing here yet.')}`; wireCards();
-}
-function emptySearchHTML() { return emptyHTML('Search the world of YouTube','Use the search bar to find songs, artists, mixes, soundtracks, live sessions and more.'); }
-function emptyHTML(h,p) { return `<div class="empty"><div><div class="empty-icon">♪</div><h3>${esc(h)}</h3><p>${esc(p)}</p></div></div>`; }
-
-function renderPlayer() {
-  const t=state.current;
-  $('#playerTitle').textContent = t?.title || 'Nothing playing';
-  $('#playerChannel').textContent = t?.channel || 'Choose a track to start';
-  $('#playerLikeBtn').textContent = t && isLiked(t.id) ? '♥' : '♡';
-  $('#miniArtWrap').innerHTML = t ? `<img class="mini-art" src="${esc(t.thumb)}" alt="" />` : `<div class="mini-art placeholder-art">♪</div>`;
-  $('#shuffleBtn').style.opacity = state.shuffle ? '1':'0.55';
-  $('#repeatBtn').style.opacity = state.repeat !== 'off' ? '1':'0.55';
-  $('#repeatBtn').textContent = state.repeat === 'one' ? '↻1' : '↻';
-  const curIndex=state.queue.findIndex(x=>x.id===t?.id);
-  if (curIndex >=0) { /* queue render highlights current */ }
-}
-
-function addToQueue(t) {
-  if (!t) return;
-  if (!state.queue.some(x=>x.id===t.id)) state.queue.push(t); else toast('Already in queue');
-  saveState(); renderQueue(); toast(`${t.title.slice(0,38)} added to queue`);
-}
-function toggleLike(t) {
-  if (isLiked(t.id)) state.liked=state.liked.filter(x=>x.id!==t.id); else state.liked.unshift(t);
-  saveState(); render(); toast(isLiked(t.id)?'Added to liked':'Removed from liked');
-}
-function playTrack(t) {
-  if (!t) return;
-  state.current=t;
-  if (!state.queue.some(x=>x.id===t.id)) state.queue.push(t);
-  state.history=[t,...state.history.filter(x=>x.id!==t.id)].slice(0,100);
-  saveState(); renderPlayer(); renderQueue();
-  if (ytReady && ytPlayer) {
-    ytPlayer.loadVideoById(t.id);
-  } else { toast('YouTube player is loading…'); }
-  startProgress();
-}
-function nextTrack() {
-  if (!state.queue.length) return;
-  let idx=state.queue.findIndex(x=>x.id===state.current?.id);
-  if (state.shuffle) idx=Math.floor(Math.random()*state.queue.length);
-  else idx=(idx+1)%state.queue.length;
-  playTrack(state.queue[idx]);
-}
-function prevTrack() {
-  if (!state.queue.length) return;
-  const idx=state.queue.findIndex(x=>x.id===state.current?.id);
-  playTrack(state.queue[(idx-1+state.queue.length)%state.queue.length]);
-}
-function togglePlay() { if(!ytReady||!ytPlayer||!state.current){ $('#searchInput').focus(); toast('Choose a track first'); return; } const s=ytPlayer.getPlayerState(); if(s===1) ytPlayer.pauseVideo(); else ytPlayer.playVideo(); }
-function startProgress(){ clearInterval(progressTimer); progressTimer=setInterval(()=>{ if(!ytPlayer||!ytReady)return; const d=ytPlayer.getDuration(),c=ytPlayer.getCurrentTime(); $('#currentTime').textContent=fmtTime(c);$('#duration').textContent=fmtTime(d);const p=d?c/d*100:0; $('#progressRange').value=Math.round(p*10); $('#progressRange').style.setProperty('--p',`${p}%`); },400); }
-
-async function api(path,params={}) {
-  const key=CONFIG.API_KEY || localStorage.getItem('shadh_youtube_api_key') || '';
-  if(!key) throw new Error('API_KEY_MISSING');
-  const u=new URL(`https://www.googleapis.com/youtube/v3/${path}`); u.searchParams.set('key',key); Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v));
-  const r=await fetch(u); const data=await r.json(); if(!r.ok || data.error) throw new Error(data.error?.message || 'YouTube API error'); return data;
-}
-async function doSearch(q) {
-  q=(q||'').trim(); if(!q)return;
-  state.query=q; state.view='discover'; render();
-  try {
-    const data=await api('search', {part:'snippet', q, type:'video', videoEmbeddable:'true', videoSyndicated:'true', maxResults:CONFIG.RESULTS, order:state.searchFilter, regionCode:CONFIG.REGION, relevanceLanguage:CONFIG.LANGUAGE, safeSearch:'moderate'});
-    state.results=dedupe((data.items||[]).map(trackFromSearch).filter(x=>x.id)); render(); toast(`Found ${state.results.length} tracks`);
-  } catch(e) {
-    console.error(e);
-    state.results=demoTracks(q);
-    render();
-    toast(e.message==='API_KEY_MISSING'?'Add your YouTube API key in API setup':'YouTube search failed — showing demo data');
-  }
-}
-
-function demoTracks(q='') {
-  const titles = q ? [`${q} — official audio`, `${q} — live`, `${q} — remix`, `${q} — playlist mix`] : ['Midnight City — sample search','Ocean Drive — sample search','Night Changes — sample search','Sunset Lover — sample search'];
-  const ids=['kJQP7kiw5Fk','5qap5aO4i9A','OPf0YbXqDm0','RBumgq5yVrA'];
-  return titles.map((title,i)=>({id:ids[i],title,channel:'Demo data · connect YouTube API',thumb:`https://i.ytimg.com/vi/${ids[i]}/hqdefault.jpg`}));
-}
-
-function onPlayerStateChange(e) {
-  const s=e.data;
-  $('#playPauseBtn').textContent = s===1 ? 'Ⅱ' : '▶';
-  if(s===0) {
-    if(state.repeat==='one' && state.current) { ytPlayer.playVideo(); return; }
-    nextTrack();
-  }
-}
-
-function onYouTubeIframeAPIReady() {
-  ytPlayer=new YT.Player('youtubePlayer',{height:'1',width:'1',videoId:state.current?.id||'',playerVars:{autoplay:0,controls:0,disablekb:1,modestbranding:1,playsinline:1,rel:0},events:{onReady:(e)=>{ytReady=true;e.target.setVolume(+$('#volumeRange').value);startProgress();},onStateChange:onPlayerStateChange,onError:(e)=>toast(`YouTube playback error (${e.data})`)}});
-}
-window.onYouTubeIframeAPIReady=onYouTubeIframeAPIReady;
-
-function openModal(html) { $('#modalContent').innerHTML=html; $('#modalBackdrop').hidden=false; }
-function closeModal() { $('#modalBackdrop').hidden=true; }
-function openApiSetup(){
-  openModal(`<h3>Connect YouTube</h3><p>Shadh Music uses the YouTube Data API v3 for search/discovery and the official YouTube IFrame Player API for playback. A browser-restricted API key is enough for search; OAuth is not needed for these public reads.</p>
-    <div class="field"><label>YouTube Data API v3 key</label><input id="apiKeyInput" type="password" value="${esc(CONFIG.API_KEY)}" placeholder="AIza…" autocomplete="off" /></div>
-    <div class="settings-grid"><div class="setting-card"><strong>Step 1</strong><span>Create a Google Cloud project and enable YouTube Data API v3.</span></div><div class="setting-card"><strong>Step 2</strong><span>Create an API key and restrict it to your website origin + YouTube Data API.</span></div></div>
-    <div class="modal-row"><button class="secondary-btn" id="apiClearBtn">Clear key</button><button class="primary-btn" id="apiSaveBtn">Save & connect</button></div>`);
-  $('#apiSaveBtn').onclick=()=>{ const k=$('#apiKeyInput').value.trim(); CONFIG.API_KEY=k; localStorage.setItem('shadh_youtube_api_key',k); closeModal(); toast(k?'YouTube API key saved':'API key cleared'); };
-  $('#apiClearBtn').onclick=()=>{CONFIG.API_KEY='';localStorage.removeItem('shadh_youtube_api_key');$('#apiKeyInput').value='';toast('API key cleared');};
-}
-function openSettings(){
-  openModal(`<h3>Settings</h3><p>Everything here stays local in your browser unless a YouTube request is made.</p>
-  <div class="settings-grid"><div class="setting-card"><strong>Theme</strong><span>${state.dark?'OLED dark':'Light clay'} appearance.</span></div><div class="setting-card"><strong>Storage</strong><span>Queue, likes, playlists and history use localStorage.</span></div><div class="setting-card"><strong>Region</strong><span>Search region is currently ${CONFIG.REGION}.</span></div><div class="setting-card"><strong>Keyboard</strong><span>Space play/pause • J previous • L next • S shuffle • R repeat • / search.</span></div></div>
-  <div class="modal-row"><button class="secondary-btn" id="resetBtn">Reset local data</button><button class="primary-btn" id="closeSetBtn">Done</button></div>`);
-  $('#closeSetBtn').onclick=closeModal; $('#resetBtn').onclick=()=>{localStorage.clear();location.reload();};
-}
-function openPlaylist(name){
-  const tracks=state.playlists[name]||[]; state.results=tracks; state.view='discover'; state.query=''; render(); toast(`${name} • ${tracks.length} tracks`);
-}
-function openPlaylistPicker(t){
-  const names=Object.keys(state.playlists);
-  openModal(`<h3>Add to playlist</h3><p>${esc(t.title)}</p><div class="settings-grid">${names.map(n=>`<button class="setting-card" data-pick="${esc(n)}"><strong>${esc(n)}</strong><span>${state.playlists[n].length} tracks</span></button>`).join('')}</div><div class="modal-row"><button class="secondary-btn" id="newFromPicker">＋ New playlist</button></div>`);
-  $$('[data-pick]').forEach(b=>b.onclick=()=>{const n=b.dataset.pick; if(!state.playlists[n].some(x=>x.id===t.id)) state.playlists[n].push(t); saveState(); closeModal(); renderSidebar(); toast(`Added to ${n}`);});
-  $('#newFromPicker').onclick=()=>{closeModal();createPlaylist(t);};
-}
-function createPlaylist(seed=null){
-  openModal(`<h3>New playlist</h3><p>Create a small local collection. You can fill it from any track's playlist button.</p><div class="field"><label>Playlist name</label><input id="plName" maxlength="40" placeholder="e.g. Sunday Drive" /></div><div class="modal-row"><button class="secondary-btn" id="cancelPl">Cancel</button><button class="primary-btn" id="savePl">Create</button></div>`);
-  $('#cancelPl').onclick=closeModal; $('#savePl').onclick=()=>{const n=$('#plName').value.trim();if(!n)return toast('Enter a name');if(!state.playlists[n])state.playlists[n]=seed?[seed]:[];saveState();closeModal();render();toast(`Playlist “${n}” created`);};
-}
-function openSleepTimer(){
-  openModal(`<h3>Sleep timer</h3><p>Stop playback automatically after the selected duration.</p><div class="settings-grid">${[15,30,45,60,90].map(m=>`<button class="setting-card" data-sleep="${m}"><strong>${m} minutes</strong><span>Stop YouTube playback</span></button>`).join('')}<button class="setting-card" data-sleep="0"><strong>Off</strong><span>Cancel timer</span></button></div>`);
-  $$('[data-sleep]').forEach(b=>b.onclick=()=>{const m=+b.dataset.sleep; clearTimeout(sleepTimeout); state.sleep=m?Date.now()+m*60000:null; sleepTimeout=m?setTimeout(()=>{if(ytPlayer)ytPlayer.pauseVideo();state.sleep=null;toast('Sleep timer finished');},m*60000):null;closeModal();toast(m?`Sleep timer: ${m} min`:'Sleep timer off');});
-}
-
-// Navigation / UI events
-$$('.nav-item[data-view]').forEach(b=>b.onclick=()=>{state.view=b.dataset.view;render();});
-$('#newPlaylistBtn').onclick=()=>createPlaylist();
-$('#settingsBtn').onclick=openSettings;
-$('#apiBtn').onclick=openApiSetup;
-$('#mobileMenuBtn').onclick=()=>$('.sidebar').classList.toggle('open');
-$('#modalClose').onclick=closeModal;
-$('#modalBackdrop').onclick=e=>{if(e.target.id==='modalBackdrop')closeModal();};
-$('#themeBtn').onclick=()=>{state.dark=!state.dark;saveState();render();};
-$('#sleepBtn').onclick=openSleepTimer;
-$('#profileBtn').onclick=()=>toast('Local profile · Shadh');
-$('#focusSearchBtn').onclick=()=>$('#searchInput').focus();
-$('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch(e.target.value);});
-$('#playPauseBtn').onclick=togglePlay;
-$('#nextBtn').onclick=nextTrack;
-$('#prevBtn').onclick=prevTrack;
-$('#shuffleBtn').onclick=()=>{state.shuffle=!state.shuffle;saveState();renderPlayer();toast(state.shuffle?'Shuffle on':'Shuffle off');};
-$('#shuffleQueueBtn').onclick=()=>{state.queue.sort(()=>Math.random()-.5);state.shuffle=true;saveState();renderQueue();renderPlayer();toast('Queue shuffled');};
-$('#repeatBtn').onclick=()=>{state.repeat=state.repeat==='off'?'all':state.repeat==='all'?'one':'off';saveState();renderPlayer();toast(`Repeat ${state.repeat}`);};
-$('#clearQueueBtn').onclick=()=>{state.queue=[];state.current=null;saveState();renderQueue();renderPlayer();toast('Queue cleared');};
-$('#queueToggleBtn').onclick=()=>$('#queuePanel').scrollIntoView({behavior:'smooth'});
-$('#miniPlayerBtn').onclick=()=>toast('Mini player is optimized for mobile');
-$('#playerLikeBtn').onclick=()=>{if(state.current)toggleLike(state.current);};
-$('#volumeRange').oninput=e=>{if(ytPlayer)ytPlayer.setVolume(+e.target.value);e.target.style.setProperty('--p',`${e.target.value}%`);};
-$('#progressRange').oninput=e=>{if(ytPlayer&&ytPlayer.getDuration()){ytPlayer.seekTo((+e.target.value/1000)*ytPlayer.getDuration(),true);} };
-
-document.addEventListener('keydown',e=>{
-  if(['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
-  if(e.key===' '){e.preventDefault();togglePlay();}
-  if(e.key.toLowerCase()==='j')prevTrack();
-  if(e.key.toLowerCase()==='l')nextTrack();
-  if(e.key.toLowerCase()==='s'){$('#shuffleBtn').click();}
-  if(e.key.toLowerCase()==='r'){$('#repeatBtn').click();}
-  if(e.key==='/'){e.preventDefault();$('#searchInput').focus();}
-});
-
-// Initial render
-render();
-if(!CONFIG.API_KEY) setTimeout(()=>toast('Tip: connect a YouTube API key for live search'),900);
+render();renderVolume();setTimeout(()=>{if(!CONFIG.API_KEY)toast('Connect YouTube for live search + recommendations');if(!ytPlayer)setupYT();},400);setTimeout(()=>loadRecommendations(false),700);

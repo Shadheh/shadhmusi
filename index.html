@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0b0c0f" />
+  <meta name="description" content="Shadh Music — a claymorphic liquid-glass YouTube music experience." />
+  <title>Shadh Music — YouTube Music Player</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="noise"></div>
+
+  <div class="app-shell">
+    <aside class="sidebar glass-panel">
+      <div class="brand">
+        <div class="brand-mark">S</div>
+        <div>
+          <div class="brand-name">Shadh</div>
+          <div class="brand-sub">Music</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Primary">
+        <button class="nav-item active" data-view="home"><span>⌂</span><span>Home</span></button>
+        <button class="nav-item" data-view="discover"><span>⌕</span><span>Discover</span></button>
+        <button class="nav-item" data-view="library"><span>▢</span><span>Library</span></button>
+        <button class="nav-item" data-view="history"><span>◷</span><span>History</span></button>
+        <button class="nav-item" data-view="liked"><span>♡</span><span>Liked</span></button>
+      </nav>
+
+      <div class="sidebar-section">
+        <div class="section-label">YOUR PLAYLISTS</div>
+        <div id="sidebarPlaylists" class="playlist-list"></div>
+        <button class="new-playlist" id="newPlaylistBtn">＋ New playlist</button>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="nav-item" id="settingsBtn"><span>⚙</span><span>Settings</span></button>
+        <button class="nav-item" id="apiBtn"><span>⌘</span><span>API setup</span></button>
+      </div>
+    </aside>
+
+    <main class="main-column">
+      <header class="topbar">
+        <button class="mobile-menu icon-btn glass-soft" id="mobileMenuBtn" aria-label="Open menu">☰</button>
+        <div class="search-wrap glass-panel">
+          <span class="search-icon">⌕</span>
+          <input id="searchInput" type="search" placeholder="Search songs, artists, albums, mixes…" autocomplete="off" />
+          <button class="search-shortcut" id="focusSearchBtn">⌘ K</button>
+        </div>
+        <div class="top-actions">
+          <button class="icon-btn glass-soft" id="sleepBtn" title="Sleep timer">◒</button>
+          <button class="icon-btn glass-soft" id="themeBtn" title="Toggle theme">◐</button>
+          <button class="avatar" id="profileBtn" title="Local profile">S</button>
+        </div>
+      </header>
+
+      <section class="content" id="content"></section>
+    </main>
+
+    <aside class="queue-panel glass-panel" id="queuePanel">
+      <div class="queue-header">
+        <div>
+          <div class="eyebrow">UP NEXT</div>
+          <h2>Queue</h2>
+        </div>
+        <button class="text-btn" id="clearQueueBtn">Clear</button>
+      </div>
+      <div id="queueList" class="queue-list"></div>
+      <div class="queue-footer">
+        <button class="wide-btn" id="shuffleQueueBtn"><span>⤨</span> Shuffle queue</button>
+      </div>
+    </aside>
+  </div>
+
+  <div class="player glass-player">
+    <div class="player-meta">
+      <div class="mini-art-wrap" id="miniArtWrap"><div class="mini-art placeholder-art">♪</div></div>
+      <div class="player-text">
+        <div id="playerTitle" class="player-title">Nothing playing</div>
+        <div id="playerChannel" class="player-channel">Choose a track to start</div>
+      </div>
+      <button class="icon-btn heart-btn" id="playerLikeBtn" title="Like">♡</button>
+    </div>
+
+    <div class="player-center">
+      <div class="transport">
+        <button class="player-btn" id="shuffleBtn" title="Shuffle">⤨</button>
+        <button class="player-btn" id="prevBtn" title="Previous">◀◀</button>
+        <button class="play-btn" id="playPauseBtn" title="Play">▶</button>
+        <button class="player-btn" id="nextBtn" title="Next">▶▶</button>
+        <button class="player-btn" id="repeatBtn" title="Repeat">↻</button>
+      </div>
+      <div class="progress-row">
+        <span id="currentTime">0:00</span>
+        <input id="progressRange" type="range" min="0" max="1000" value="0" aria-label="Playback progress" />
+        <span id="duration">0:00</span>
+      </div>
+    </div>
+
+    <div class="player-right">
+      <button class="player-btn" id="queueToggleBtn" title="Queue">☷</button>
+      <button class="player-btn" id="miniPlayerBtn" title="Mini player">▣</button>
+      <div class="volume-control"><span>◖</span><input id="volumeRange" type="range" min="0" max="100" value="80" aria-label="Volume" /></div>
+    </div>
+  </div>
+
+  <div class="youtube-host" id="youtubeHost" aria-hidden="true"><div id="youtubePlayer"></div></div>
+
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal glass-panel" role="dialog" aria-modal="true">
+      <button class="modal-close" id="modalClose">×</button>
+      <div id="modalContent"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="app.js"></script>
+</body>
+</html>

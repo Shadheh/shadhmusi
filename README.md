@@ -24,7 +24,11 @@ A premium claymorphic / liquid-glass YouTube music web app.
 
 ## YouTube API setup
 
-1. Create a Google Cloud project.
+The included `config.js` is prefilled with the YouTube Data API v3 key supplied for this build. The app automatically uses it when no browser-saved key exists.
+
+For safety, restrict that key in Google Cloud to **YouTube Data API v3** and the exact origins you will use (for example your production site and localhost during development). Because browser code can expose client-side keys, rotate the key before publishing this project publicly if you do not want the currently supplied key to remain associated with this build.
+
+1. Create or select a Google Cloud project.
 2. Enable **YouTube Data API v3**.
 3. Create an API key.
 4. Restrict the key to your web origin and to the YouTube Data API where practical.

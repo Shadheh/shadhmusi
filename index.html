@@ -104,12 +104,13 @@
 
   <div class="youtube-host" id="youtubeHost" aria-hidden="true"><div id="youtubePlayer"></div></div>
 
-  <div class="modal-backdrop" id="modalBackdrop" hidden>
-    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-      <button class="modal-close" id="modalClose" aria-label="Close">×</button>
-      <div id="modalContent"></div>
+  <section class="utility-panel" id="utilityPanel" hidden aria-live="polite">
+    <div class="utility-panel-head">
+      <div class="eyebrow">SHADH MUSIC</div>
+      <button class="utility-panel-close" id="panelClose" aria-label="Close panel">×</button>
     </div>
-  </div>
+    <div id="panelContent"></div>
+  </section>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="config.js"></script>
